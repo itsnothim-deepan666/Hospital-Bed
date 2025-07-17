@@ -1,0 +1,20 @@
+bed/.vscode/
+bed/.pio
+bed_gui/.vscode
+bed_gui/.pio
+imu_only_main/.vscode
+imu_only_main/.pio
+imu_test/.vscode
+imu_test/.pio
+motor tester/.vscode
+motor tester/.pio
+motoronlytest/.vscode
+motoronlytest/.pio
+multiplexer/.vscode
+multiplexer/.pio
+mux_og/.vscode
+mux_og/.pio
+mux_test/.vscode
+mux_test/.pio
+mux_to_esp/.vscode
+mux_to_esp/.pio
