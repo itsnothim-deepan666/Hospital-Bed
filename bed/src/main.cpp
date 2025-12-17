@@ -1,410 +1,301 @@
-//channel for bottom is changed
-
-#include <Adafruit_MPU6050.h>
-#include <WiFiUdp.h>
+// Cleaned and ESP32-adapted version
 #include <WiFi.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <Wire.h>
-#include <HardwareSerial.h>
-
-String ssid = "deepan";
-String password = "hehehehe";
-String option[4] = {"TOP", "RIGHT", "BOTTOM", "LEFT"};
-int currentoption = -1;
-String angle[4] = {"0", "30", "45", "60"}; // Angles for each motor
-int currentangle = -1;
-int cir = 0;
-
-int ind;
-// Built-in LED pin for ESP32 (usually GPIO 2)
-#define ESP32_LED_PIN 2
-
+#include <WiFiUdp.h>
+#include <functional>
 
 WiFiUDP udp;
-#define NUM_IMUS 3
-Adafruit_MPU6050 imu_arr[NUM_IMUS];
-bool imu_initialized[NUM_IMUS] = {false, false, false};
-uint8_t imu_channels[NUM_IMUS] = {0, 2, 3};
 
+const int pwmMotor1 = 32; // Motor 1 (Top) pin D32
+const int dirMotor1 = 33;
+const int pwmMotor2 = 18; // Motor 2 (Bottom) pin D18
+const int dirMotor2 = 19;
+const int pwmMotor3 = 5; // Motor 3 (Side) 
+const int dirMotor3 = 4;
+
+// LEDC (PWM) configuration for ESP32
+const int PWM_FREQ = 5000;
+const int PWM_RESOLUTION = 8; // 8-bit (0-255)
+const int PWM_CHANNEL_MOTOR1 = 0;
+const int PWM_CHANNEL_MOTOR2 = 1;
+const int PWM_CHANNEL_MOTOR3 = 2;
+
+
+// Nextion Serial (Serial2) pins & baud
+const int NEXTION_RX_PIN = 16; // ESP32 pin connected to Nextion TX
+const int NEXTION_TX_PIN = 17; // ESP32 pin connected to Nextion RX
+const uint32_t NEXTION_BAUD = 9600;
+
+// Send a raw command to Nextion (keeps only this helper as requested)
+void nextionCommand(const char *cmd) {
+  Serial2.print(cmd);
+  Serial2.write((uint8_t)0xFF);
+  Serial2.write((uint8_t)0xFF);
+  Serial2.write((uint8_t)0xFF);
+  Serial2.flush();
+}
+
+// WiFi credentials
+String ssid = "deepan";
+String password = "hehehehe";
+
+// Options and angles
+const char* optionNames[4] = {"TOP", "RIGHT", "BOTTOM", "LEFT"};
+const float angleValues[4] = {0.0f, 30.0f, 45.0f, 60.0f};
+int currentoption = 0;
+int currentangle = 0;
+// state for Nextion pages and selections
+int currentPage = 0; // 0 = page0, 1 = page1
+int selPage0 = 0;    // selected index on page0 (0..3)
+int selPage1 = 0;    // selected index on page1 (0..4)
+
+// Nextion component names - update these to match your HMI
+const char* PAGE0_BTN_NAMES[4] = {"b0", "b1", "b3", "b2"};
+const char* PAGE1_BTN_NAMES[5] = {"b1", "b2", "b3", "b4", "b0"};
+#define LED_PIN 2
+// Hardware & networking
+#define TCAADDR 0x70
+#define LED_PIN 2
+Adafruit_MPU6050 imu;
+bool imuTop_ok = false;
+bool imuBottom_ok = false;
+bool imuSides_ok = false;
 const unsigned int localUdpPort = 12345;
 char incomingPacket[255];
-#define MOTOR_PWM_VALUE 255 // Full speed (0-255)
-char packet2[255];
 
-// Motor Pins
-const int pwmMotor1 = 32; // Motor 1 (Top)
-const int dirMotor1 = 33;
-const int pwmMotor2 = 18; // Motor 2 (Bottom)
-const int dirMotor2 = 19;
-const int pwmMotor3 = 4; // Motor 3 (Side)
-const int dirMotor3 = 5;
+// Helper index wrapper
+int Index(int idx, int size) {
+  if (idx < 0) return 0;
+  return idx % size;
+}
 
-float hAngle(sensors_event_t a, uint8_t index) {
-  float accel_offsets[3][3] = {
-    {0.05, -0.01, 0.03},  // IMU 0
-    {0.02, -0.02, 0.01},  // IMU 2
-    {0.00,  0.00, 0.00}   // IMU 3
-  };
-  float ax = a.acceleration.x - accel_offsets[index][0];
-  float ay = a.acceleration.y - accel_offsets[index][1];
-  float az = a.acceleration.z - accel_offsets[index][2];
+float hAngle(sensors_event_t a) {
+  // Simple pitch calculation from accelerometer
+  float accel_offsets[3] = {0.05f, -0.01f, 0.03f};
+  float ax = a.acceleration.x - accel_offsets[0];
+  float ay = a.acceleration.y - accel_offsets[1];
+  float az = a.acceleration.z - accel_offsets[2];
   float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
   return pitch;
 }
 
-// Example selectIMU function
-#define MUX_ADDR 0x70
-void selectIMU(uint8_t index) {
-  if (index > 7) return;
-  Wire.beginTransmission(MUX_ADDR);
-  Wire.write(1 << index);
+// Select TCA9548A multiplexer channel (0..7)
+void selectMuxChannel(uint8_t ch) {
+  if (ch > 7) return;
+  Wire.beginTransmission(TCAADDR);
+  Wire.write(1 << ch);
   Wire.endTransmission();
+  // small delay to allow bus to settle
+  delay(1);
 }
 
+// single IMU instance will be used after selecting the appropriate mux channel
+
 void stopMotors() {
-  analogWrite(pwmMotor1, 0);
-  analogWrite(pwmMotor2, 0);
-  analogWrite(pwmMotor3, 0);
+  ledcWrite(pwmMotor1, 0);
+  ledcWrite(pwmMotor2, 0);
+  ledcWrite(pwmMotor3, 0);
   Serial.println("All Motors Stopped");
 }
 
-void TopUp(float angle, uint8_t index, int i) {
-  while (true) {
-    selectIMU(index);
-    sensors_event_t a,g,t;
-    imu_arr[uint8_t(0)].getEvent(&a,&g,&t);
-    float pitch = hAngle(a, index);
-    Serial.print("Pitch: ");
-    Serial.println(pitch);
-    if (pitch >= angle){
-      i++;
+// keep only nextionCommand (defined earlier)
+
+// Add simple timeout safety to motor movements
+bool waitUntilPitchCondition(uint32_t timeoutMs, std::function<bool(float)> condition, uint8_t mux_channel) {
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    selectMuxChannel(mux_channel);
+    sensors_event_t a, g, t;
+    imu.getEvent(&a, &g, &t);
+    float pitch = hAngle(a);
+    if (condition(pitch)) return true;
+    delay(20);
+  }
+  return false;
+}
+
+void TopUp(float target, int unused) {
+  digitalWrite(dirMotor1, HIGH);
+  ledcWrite(PWM_CHANNEL_MOTOR1, 255);
+  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p >= target; }, 0);
+  if (!ok) Serial.println("TopUp timeout");
+  stopMotors();
+}
+
+void TopDown(float target, int unused) {
+  digitalWrite(dirMotor1, LOW);
+  ledcWrite(PWM_CHANNEL_MOTOR1, 255);
+  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p <= target; }, 0);
+  if (!ok) Serial.println("TopDown timeout");
+  stopMotors();
+}
+
+void BottomUp(float target, int unused) {
+  digitalWrite(dirMotor2, LOW);
+  ledcWrite(PWM_CHANNEL_MOTOR2, 255);
+  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p >= target; }, 2);
+  if (!ok) Serial.println("BottomUp timeout");
+  stopMotors();
+}
+
+void BottomDown(float target, int unused) {
+  digitalWrite(dirMotor2, HIGH);
+  ledcWrite(PWM_CHANNEL_MOTOR2, 255);
+  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p <= target; }, 2);
+  if (!ok) Serial.println("BottomDown timeout");
+  stopMotors();
+}
+
+void SideLeft(float target) {
+  digitalWrite(dirMotor3, LOW);
+  ledcWrite(PWM_CHANNEL_MOTOR3, 255);
+  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p >= target; }, 3);
+  if (!ok) Serial.println("SideLeft timeout");
+  stopMotors();
+}
+
+void SideRight(float target) {
+  digitalWrite(dirMotor3, HIGH);
+  ledcWrite(PWM_CHANNEL_MOTOR3, 255);
+  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p <= target; }, 3);
+  if (!ok) Serial.println("SideRight timeout");
+  stopMotors();
+}
+
+void handling(String cmd) {
+  // cmd is expected to be "0" for cycle, "1" for select/confirm
+  if (cmd == "0") {
+    if (currentPage == 0) {
+      selPage0 = (selPage0 + 1) % 4;
+      Serial.print("Page0 selection -> "); Serial.println(selPage0);
+      // update colors: highlighted = 65504, others = 8200
+      for (int i = 0; i < 4; ++i) {
+        String c = String(PAGE0_BTN_NAMES[i]) + ".bco=" + String((i == selPage0) ? 65504 : 8200);
+        nextionCommand(c.c_str());
+      }
+    } else if (currentPage == 1) {
+      selPage1 = (selPage1 + 1) % 5;
+      Serial.print("Page1 selection -> "); Serial.println(selPage1);
+      for (int i = 0; i < 5; ++i) {
+        String c = String(PAGE1_BTN_NAMES[i]) + ".bco=" + String((i == selPage1) ? 65504 : 8200);
+        nextionCommand(c.c_str());
+      }
     }
-    if (i==3) break;
-    digitalWrite(dirMotor1, LOW);
-    analogWrite(pwmMotor1, MOTOR_PWM_VALUE);
-    Serial.print("Motor1up");
-  }
-  stopMotors();
-}
-
-void TopDown(float angle, uint8_t index, int i) {
-  while (true) {
-    selectIMU(index);
-    sensors_event_t a,g,t;
-    imu_arr[uint8_t(0)].getEvent(&a,&g,&t);
-    float pitch = hAngle(a, index);
-    if (pitch <= angle){
-      i++;
-    }
-    if (i==3) break;
-    Serial.print("Pitch: ");
-    Serial.println(pitch);
-    digitalWrite(dirMotor1, HIGH);
-    analogWrite(pwmMotor1, MOTOR_PWM_VALUE);
-    Serial.print("Motor1down");
-  }
-  stopMotors();
-}
-
-void BottomUp(float angle, uint8_t index, int i) {
-  while (true) {
-    selectIMU(index);
-    sensors_event_t a,g,t;
-    imu_arr[uint8_t(1)].getEvent(&a,&g,&t);
-    float pitch = hAngle(a, index);
-    Serial.print("Pitch: ");
-    Serial.println(pitch);
-    if (pitch >= angle){
-      i++;
-    }
-    if (i==3) break;
-    digitalWrite(dirMotor2, LOW);
-    analogWrite(pwmMotor2, MOTOR_PWM_VALUE);
-    Serial.print("Motor2up");
-  }
-  stopMotors();
-}
-
-void BottomDown(float angle, uint8_t index, int i) {
-  while (true) {
-    selectIMU(index);
-    sensors_event_t a,g,t;
-    imu_arr[uint8_t(1)].getEvent(&a,&g,&t);
-    float pitch = hAngle(a, index);
-    Serial.print("Pitch: ");
-    Serial.println(pitch);
-    if (pitch <= angle){
-      i++;
-    }
-    if (i==3) break;
-    digitalWrite(dirMotor2, HIGH);
-    analogWrite(pwmMotor2, MOTOR_PWM_VALUE);
-    Serial.print("Motor1down");
-  }
-  stopMotors();
-}
-
-void SideLeft(float angle, uint8_t index) {
-  while (true) {
-    selectIMU(index);
-    sensors_event_t a,g,t;
-    imu_arr[uint8_t(2)].getEvent(&a,&g,&t);
-    float pitch = hAngle(a, index);
-    Serial.print("Pitch: ");
-    Serial.println(pitch);
-    if (pitch >= angle) break;
-    digitalWrite(dirMotor3, LOW);
-    digitalWrite(pwmMotor3, HIGH);
-    Serial.print("Motor3left");
-  }
-  stopMotors();
-}
-
-void SideRight(float angle, uint8_t index) {
-  while (true) {
-    selectIMU(index);
-    sensors_event_t a,g,t;
-    imu_arr[uint8_t(2)].getEvent(&a,&g,&t);
-    float pitch = hAngle(a, index);
-    Serial.print("Pitch: ");
-    Serial.println(pitch);
-    if (pitch <= angle) break;
-    digitalWrite(dirMotor3, HIGH);
-    digitalWrite(pwmMotor3, HIGH);
-    Serial.print("Motor3right");
-  }
-  stopMotors();
-}
-
-void handling(String cmd,int go){
-  if (cmd=="0"){
-    (go == 0) ? currentoption++ : currentangle++ ;
-    int curr = (go == 0) ? currentoption : currentangle;
-    curr = curr % 4;
-    Serial.print("Current Option: ");
-    Serial.println((go == 0) ? option[curr] : angle[curr]);
     return;
   }
-  else if(cmd=="1"){
-    int curr = (go == 0) ? currentoption : currentangle;
-    curr = curr % 4;
-    Serial.println("Your choice is: " + ((cir == 0 && currentangle==-1) ? option[curr] : angle[curr]+" degrees"));
-    if(go == 0) {
-      cir = 1;
-      switch(currentoption % 4) {
-        case 0: { // TOP
-          ind = 0;
-          break;
-            }
-        case 1: { // RIGHT
-          ind = 2;
-          break;
+
+  if (cmd == "1") {
+    if (currentPage == 0) {
+      // confirm selection on page0 -> go to page1
+      int opt = selPage0;
+      Serial.print("Confirmed page0 opt: "); Serial.println(opt);
+      // move to page 1 on the Nextion
+      nextionCommand("page 1");
+      delay(50);
+      currentPage = 1;
+      selPage1 = 0;
+      // initialize page1 buttons colors
+      for (int i = 0; i < 5; ++i) {
+        String c = String(PAGE1_BTN_NAMES[i]) + ".bco=" + String((i == selPage1) ? 65504 : 8200);
+        nextionCommand(c.c_str());
+      }
+      return;
+    } else if (currentPage == 1) {
+      // confirm selection on page1
+      Serial.print("Confirmed page1 opt: "); Serial.println(selPage1);
+      if (selPage1 == 4) {
+        // back selected -> return to page0
+        nextionCommand("page 0");
+        delay(50);
+        currentPage = 0;
+        selPage0 = 0;
+        for (int i = 0; i < 4; ++i) {
+          String c = String(PAGE0_BTN_NAMES[i]) + ".bco=" + String((i == selPage0) ? 65504 : 8200);
+          nextionCommand(c.c_str());
         }
-        case 2: { // BOTTOM
-          ind = 1;
+        return;
+      }
+
+      // else: a valid angle was selected (0,30,45,60)
+      float target = angleValues[selPage1];
+      int axis = selPage0; // axis selected previously on page0
+      sensors_event_t a,g,t;
+      // choose the correct IMU based on axis: 0=TOP,2=BOTTOM,1/3=SIDES
+      switch(axis) {
+        case 0:
+          selectMuxChannel(0);
+          imu.getEvent(&a,&g,&t);
           break;
-        }
-        case 3: { // LEFT
-          ind = 2;
+        case 2:
+          selectMuxChannel(2);
+          imu.getEvent(&a,&g,&t);
           break;
-        }
+        case 1:
+        case 3:
         default:
-          Serial.println("Invalid choice");
+          selectMuxChannel(3);
+          imu.getEvent(&a,&g,&t);
           break;
       }
-    }
-    else if (cir == 1) {
-      Serial.println("You selected angle: " + angle[currentangle % 4]);
-      switch(currentangle % 4) {
-        case 0: {
-          selectIMU(imu_channels[ind]);
-          sensors_event_t a,g,t;
-          imu_arr[ind].getEvent(&a,&g,&t);
-          float pitch = hAngle(a, imu_channels[ind]);
-          if (pitch > 0.0) {
-            if (ind == 0) {
-              TopDown(0.0, imu_channels[ind], 0);
-            } else if (ind == 1) {
-              BottomDown(0.0, imu_channels[ind], 0);
-            } else if (ind == 2) {
-              switch(curr){
-                case 1:
-                  SideLeft(0.0, imu_channels[ind]);
-                  break;
-                default:
-                  Serial.println("Motor is already at 0 degrees");
-                  break;
-              }
-            }
-          }
-          else if (pitch < 0.0) {
-            switch(ind) {
-              case 3:
-                SideRight(0.0, ind);
-                break;
-              default:
-                Serial.println("Error: Pitch is negative, cannot set to 0 degrees");
-                break;
-            }
-          }
-          else {
-            Serial.println("Motor is already at 0 degrees");
-          }
+      float pitch = hAngle(a);
+      Serial.print("Moving axis "); Serial.print(axis); Serial.print(" to "); Serial.println(target);
+      switch(axis) {
+        case 0: // TOP
+          if (pitch < target) TopUp(target,0); else TopDown(target,0);
+          Serial.println("TOP movement implemented virtually");
           break;
-        }
-        case 1: {
-          selectIMU(ind);
-          sensors_event_t a,g,t;
-          imu_arr[ind].getEvent(&a,&g,&t);
-          float pitch = hAngle(a, imu_channels[ind]);
-          if (pitch < 30.0 && pitch > -30.0) {
-            if (ind == 0) {
-              TopUp(30.0, imu_channels[ind], 0);
-            } else if (ind == 1) {
-              BottomUp(30.0, imu_channels[ind], 0);
-            } else if(ind == 2){
-              switch(curr){
-                case 1:
-                  SideRight(30.0, imu_channels[ind]);
-                  break;
-                case 3:
-                  SideLeft(-30.0, imu_channels[ind]);
-                  break;
-              }
-              break;
-            }
-          } else if(pitch > 30.0 && pitch < -30.0) {
-              if (ind == 0) {
-                TopDown(30.0, imu_channels[ind], 0);
-              } else if (ind == 1) {
-                BottomDown(30.0, imu_channels[ind], 0);
-              } else if(ind == 2){
-                switch(curr){
-                  case 1:
-                    SideLeft(30.0, imu_channels[ind]);
-                    break;
-                  case 3:
-                    SideRight(-30.0, ind);
-                    break;
-                }
-              }
-              break;
-          }
-          else {
-            Serial.println("Motor is already at 30 degrees");
-          }
+        case 2: // BOTTOM
+          if (pitch < target) BottomUp(target,0); else BottomDown(target,0);
+          Serial.println("BOTTOM movement implemented virtually");
           break;
-        }
-        case 2: {
-          selectIMU(imu_channels[ind]);
-          sensors_event_t a,g,t;
-          imu_arr[ind].getEvent(&a,&g,&t);
-          float pitch = hAngle(a, imu_channels[ind]);
-          if (pitch < 45.0 && pitch > -45.0) {
-            if (ind == 0) {
-              TopUp(45.0, imu_channels[ind], 0);
-            } else if (ind == 1) {
-              BottomUp(45.0, imu_channels[ind], 0);
-            } else if(ind == 2){
-              switch(curr){
-                case 1:
-                  SideRight(45.0, imu_channels[ind]);
-                  break;
-                case 3:
-                  SideLeft(-45.0, imu_channels[ind]);
-                  break;
-              }
-              break;
-            }
-          } else if(pitch > 45.0 && pitch < -45.0) {
-              if (ind == 0) {
-                TopDown(45.0, imu_channels[ind], 0);
-              } else if (ind == 1) {
-                BottomDown(45.0, imu_channels[ind], 0);
-              } else if(ind == 2){
-                switch(curr){
-                  case 1:
-                    SideLeft(45.0, imu_channels[ind]);
-                    break;
-                  case 3:
-                    SideRight(-45.0, imu_channels[ind]);
-                    break;
-                }
-                break;
-              }
-          }
-          else {
-            Serial.println("Motor is already at 45 degrees");
-          }
+        case 1: // RIGHT
+          if (pitch < target) SideRight(target); else SideLeft(-target);
+          Serial.println("RIGHT movement implemented virtually");
           break;
-        }
-        case 3: {
-          selectIMU(imu_channels[ind]);
-          sensors_event_t a,g,t;
-          imu_arr[ind].getEvent(&a,&g,&t);
-          float pitch = hAngle(a, imu_channels[ind]);
-          if (pitch < 60.0 && pitch > -60.0) {
-            if (ind == 0) {
-              TopUp(60.0, imu_channels[ind], 0);
-            } else if (ind == 1) {
-              BottomUp(60.0, imu_channels[ind], 0);
-            } else if(ind == 2){
-              switch(curr){
-                case 1:
-                  SideRight(60.0, imu_channels[ind]);
-                  break;
-                case 3:
-                  SideLeft(-60.0, imu_channels[ind]);
-                  break;
-              }
-              break;
-            }
-          } else if(pitch > 60.0 && pitch < -60.0) {
-              if (ind == 0) {
-                TopDown(60.0, imu_channels[ind], 0);
-              } else if (ind == 1) {
-                BottomDown(60.0, imu_channels[ind], 0);
-              } else if(ind == 2){
-                switch(curr){
-                  case 1:
-                    SideLeft(60.0, imu_channels[ind]);
-                    break;
-                  case 3:
-                    SideRight(-60.0, imu_channels[ind]);
-                    break;
-                }
-                break;
-              }
-          }
-          else {
-            Serial.println("Motor is already at 60 degrees");
-          }
+        case 3: // LEFT
+          if (pitch < target) SideRight(target); else SideLeft(-target);
+          Serial.println("LEFT movement implemented virtually");
           break;
-        }
         default:
-          Serial.println("Invalid angle choice");
-          break;
-        }
+          Serial.println("Invalid axis");
       }
+      // Optionally notify Nextion that movement is done
+      String doneCmd = String("t1.txt=\"Done\"");
+      nextionCommand(doneCmd.c_str());
+      return;
     }
   }
-
+}
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(21, 22);        // Start I2C
-  Wire.setClock(10000); // Set I2C clock speed to 400kHz
-  // Setup motor pins
+  // I2C pins for ESP32
+  const int SDA_PIN = 21;
+  const int SCL_PIN = 22;
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  Wire.begin(21, 22);
+
   pinMode(pwmMotor1, OUTPUT);
   pinMode(dirMotor1, OUTPUT);
   pinMode(pwmMotor2, OUTPUT);
   pinMode(dirMotor2, OUTPUT);
   pinMode(pwmMotor3, OUTPUT);
   pinMode(dirMotor3, OUTPUT);
-  // Setup onboard LED pin (GPIO 2)
-  pinMode(2, OUTPUT);
-  // Setup WiFi and UDP
+  pinMode(LED_PIN, OUTPUT);
+
+  // Setup PWM channels for ESP32
+  ledcSetup(PWM_CHANNEL_MOTOR1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(pwmMotor1, PWM_CHANNEL_MOTOR1);
+  ledcSetup(PWM_CHANNEL_MOTOR2, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(pwmMotor2, PWM_CHANNEL_MOTOR2);
+  ledcSetup(PWM_CHANNEL_MOTOR3, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(pwmMotor3, PWM_CHANNEL_MOTOR3);
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password); // <-- Set your WiFi credentials
+  WiFi.begin(ssid.c_str(), password.c_str());
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -414,35 +305,57 @@ void setup() {
   Serial.print("ESP32 IP address: ");
   Serial.println(WiFi.localIP());
   udp.begin(localUdpPort);
-  Serial.printf("Listening on UDP port %d\n", localUdpPort);
-
-  // Initialize IMUs
-  for (uint8_t i = 0; i < NUM_IMUS; i++) {
-    selectIMU(imu_channels[i]);
-    delay(50);
-    if (!imu_arr[i].begin(0x68)) {
-      Serial.print("MPU6050 NOT found on channel ");
-      Serial.println(imu_channels[i]);
-      imu_initialized[i] = false;
-    } else {
-      Serial.print("MPU6050 initialized on channel ");
-      Serial.println(imu_channels[i]);
-      imu_arr[i].setAccelerometerRange(MPU6050_RANGE_8_G);
-      imu_initialized[i] = true;
-    }
+  Serial.print("Listening on UDP port "); Serial.println(localUdpPort);
+  
+  // Initialize IMUs behind TCA9548A multiplexer
+  selectMuxChannel(0);
+  if (!imu.begin(0x68)) {
+    Serial.println("MPU6050 (TOP) NOT found on mux channel 0!");
+    imuTop_ok = false;
+  } else {
+    Serial.println("MPU6050 (TOP) initialized on mux channel 0");
+    imu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    imuTop_ok = true;
   }
+
+  selectMuxChannel(2);
+  if (!imu.begin(0x68)) {
+    Serial.println("MPU6050 (BOTTOM) NOT found on mux channel 2!");
+    imuBottom_ok = false;
+  } else {
+    Serial.println("MPU6050 (BOTTOM) initialized on mux channel 2");
+    imu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    imuBottom_ok = true;
+  }
+
+  selectMuxChannel(3);
+  if (!imu.begin(0x68)) {
+    Serial.println("MPU6050 (SIDES) NOT found on mux channel 3!");
+    imuSides_ok = false;
+  } else {
+    Serial.println("MPU6050 (SIDES) initialized on mux channel 3");
+    imu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    imuSides_ok = true;
+  }
+  // Initialize Serial2 for Nextion display and go to page 0
+  Serial2.begin(NEXTION_BAUD, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
+  delay(100);
+  Serial.println("Initializing Nextion to page 0");
+  nextionCommand("page 0");
+  delay(50);
+  Serial.println("Initialized Nextion to page 0");
+  currentPage = 0;
+  selPage0 = 0;
+  // initialize page0 buttons: highlight first, others default
+  for (int i = 0; i < 4; ++i) {
+    String c = String(PAGE0_BTN_NAMES[i]) + ".bco=" + String((i == selPage0) ? 65504 : 8200);
+    nextionCommand(c.c_str());
+  }
+  // set a small idle text on t1
+  //nextionCommand("t1.txt=\"Idle\"");
 }
 
-
-// Set your laptop's hotspot IP and port here
-#define LAPTOP_IP_1 192
-#define LAPTOP_IP_2 168
-#define LAPTOP_IP_3 137
-#define LAPTOP_IP_4 1  // Default for Windows hotspot, change if needed
-#define LAPTOP_PORT 12346  // Must match your Python script
-
 void loop() {
-  // Receive data from UDP and blink LED on each packet
   int packetSize = udp.parsePacket();
   if (packetSize) {
     int len = udp.read(incomingPacket, sizeof(incomingPacket) - 1);
@@ -450,17 +363,16 @@ void loop() {
       incomingPacket[len] = 0;
       Serial.print("Received from UDP: ");
       Serial.println(incomingPacket);
-      // Blink built-in LED if packet is '1' or '0'
       if (strcmp(incomingPacket, "1") == 0) {
-        digitalWrite(ESP32_LED_PIN, HIGH);
-        delay(200); // Short blink for '1'
-        digitalWrite(ESP32_LED_PIN, LOW);
+        digitalWrite(LED_PIN, HIGH);
+        delay(200);
+        digitalWrite(LED_PIN, LOW);
       } else if (strcmp(incomingPacket, "0") == 0) {
-        digitalWrite(ESP32_LED_PIN, HIGH);
-        delay(800); // Long blink for '0'
-        digitalWrite(ESP32_LED_PIN, LOW);
+        digitalWrite(LED_PIN, HIGH);
+        delay(800);
+        digitalWrite(LED_PIN, LOW);
       }
-      handling(String(incomingPacket), cir);
+      handling(String(incomingPacket));
     }
   }
   delay(50);
