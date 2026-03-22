@@ -1,0 +1,24 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../../.vscode/python"
+		},
+		{
+			"name": "mux_to_esp",
+			"path": "../../mux_to_esp"
+		},
+		{
+			"name": "motor tester",
+			"path": "../../motor tester"
+		},
+		{
+			"name": "bed",
+			"path": "../../bed"
+		},
+		{
+			"name": "bed_gui",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
