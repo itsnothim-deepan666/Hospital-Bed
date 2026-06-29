@@ -1,301 +1,402 @@
-// Cleaned and ESP32-adapted version
+#include <Arduino.h>
 #include <WiFi.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
+#include <WebServer.h>
 #include <WiFiUdp.h>
-#include <functional>
 
+WebServer server(80);
 WiFiUDP udp;
 
-const int pwmMotor1 = 32; // Motor 1 (Top) pin D32
-const int dirMotor1 = 33;
-const int pwmMotor2 = 18; // Motor 2 (Bottom) pin D18
-const int dirMotor2 = 19;
-const int pwmMotor3 = 5; // Motor 3 (Side) 
-const int dirMotor3 = 4;
+// ===================== MOTOR PINS =====================
+constexpr int PWM_M1 = 25;
+constexpr int DIR_M1 = 26;
+constexpr int PWM_M2 = 27;
+constexpr int DIR_M2 = 14;
+constexpr int PWM_M3 = 18; // Side Motor
+constexpr int DIR_M3 = 19; // Side Motor
 
-// LEDC (PWM) configuration for ESP32
-const int PWM_FREQ = 5000;
-const int PWM_RESOLUTION = 8; // 8-bit (0-255)
-const int PWM_CHANNEL_MOTOR1 = 0;
-const int PWM_CHANNEL_MOTOR2 = 1;
-const int PWM_CHANNEL_MOTOR3 = 2;
+// ===================== PWM CONFIG =====================
+constexpr int PWM_FREQ = 20000;
+constexpr int PWM_RES  = 8;
+constexpr int MAX_DUTY = 255;
+constexpr int RAMP_STEP = 10;
 
+// ===================== BUTTON PINS =====================
+constexpr int BTN_M1_FWD = 34;
+constexpr int BTN_M1_REV = 35;
+constexpr int BTN_M2_FWD = 32;
+constexpr int BTN_M2_REV = 33;
+constexpr int BTN_M3_L   = 5;  // Side Left
+constexpr int BTN_M3_R   = 21; // Side Right
 
-// Nextion Serial (Serial2) pins & baud
-const int NEXTION_RX_PIN = 16; // ESP32 pin connected to Nextion TX
-const int NEXTION_TX_PIN = 17; // ESP32 pin connected to Nextion RX
-const uint32_t NEXTION_BAUD = 9600;
+// ===================== TIMING =====================
+constexpr uint32_t COAST_MS   = 150;
+constexpr uint32_t LOCKOUT_MS = 200;
+constexpr uint32_t NEXTION_RUN_MS = 5000; // 5 seconds for Nextion movement
 
-// Send a raw command to Nextion (keeps only this helper as requested)
-void nextionCommand(const char *cmd) {
-  Serial2.print(cmd);
-  Serial2.write((uint8_t)0xFF);
-  Serial2.write((uint8_t)0xFF);
-  Serial2.write((uint8_t)0xFF);
-  Serial2.flush();
-}
+enum class State { STOP, RUN_FWD, RUN_REV, COAST, LOCKOUT };
+
+struct Motor {
+  int pwmPin;
+  int dirPin;
+  int channel;
+  State state;
+  int targetDir;
+  int currentDuty;
+  uint32_t stateStart;
+};
+
+// ===================== GLOBAL OBJECTS =====================
+Motor m1 = {PWM_M1, DIR_M1, 0, State::STOP, 0, 0, 0};
+Motor m2 = {PWM_M2, DIR_M2, 1, State::STOP, 0, 0, 0};
+Motor m3 = {PWM_M3, DIR_M3, 2, State::STOP, 0, 0, 0};
+
+const int btnPins[6] = {BTN_M1_FWD, BTN_M1_REV, BTN_M2_FWD, BTN_M2_REV, BTN_M3_L, BTN_M3_R};
+bool btnStates[6] = {false, false, false, false, false, false};
+
+// Web server target directions
+int webTargetDir[3] = {0, 0, 0};
+
+// UDP/Nextion target directions and stop timers
+int udpTargetDir[3] = {0, 0, 0};
+uint32_t udpStopTime[3] = {0, 0, 0};
 
 // WiFi credentials
-String ssid = "deepan";
-String password = "hehehehe";
+const char* ssid = "deepan";
+const char* password = "hehehehe";
 
-// Options and angles
-const char* optionNames[4] = {"TOP", "RIGHT", "BOTTOM", "LEFT"};
-const float angleValues[4] = {0.0f, 30.0f, 45.0f, 60.0f};
-int currentoption = 0;
-int currentangle = 0;
-// state for Nextion pages and selections
-int currentPage = 0; // 0 = page0, 1 = page1
-int selPage0 = 0;    // selected index on page0 (0..3)
-int selPage1 = 0;    // selected index on page1 (0..4)
+// ===================== NEXTION CONFIG =====================
+constexpr int RX_PIN = 16; // Change to your ESP32 RX pin
+constexpr int TX_PIN = 17; // Change to your ESP32 TX pin
+constexpr uint16_t UDP_PORT = 12345;
 
-// Nextion component names - update these to match your HMI
-const char* PAGE0_BTN_NAMES[4] = {"b0", "b1", "b3", "b2"};
-const char* PAGE1_BTN_NAMES[5] = {"b1", "b2", "b3", "b4", "b0"};
-#define LED_PIN 2
-// Hardware & networking
-#define TCAADDR 0x70
-#define LED_PIN 2
-Adafruit_MPU6050 imu;
-bool imuTop_ok = false;
-bool imuBottom_ok = false;
-bool imuSides_ok = false;
-const unsigned int localUdpPort = 12345;
-char incomingPacket[255];
+int currentPage = 0;
+int currentSelection = 0;
+int selectedMotor = 0; // 0=None, 1=M1, 2=M2, 3=M3
 
-// Helper index wrapper
-int Index(int idx, int size) {
-  if (idx < 0) return 0;
-  return idx % size;
+// ===================== NEXTION HELPERS =====================
+void nextionSend(const String& cmd) {
+  Serial1.print(cmd);
+  Serial1.write(0xFF);
+  Serial1.write(0xFF);
+  Serial1.write(0xFF);
 }
 
-float hAngle(sensors_event_t a) {
-  // Simple pitch calculation from accelerometer
-  float accel_offsets[3] = {0.05f, -0.01f, 0.03f};
-  float ax = a.acceleration.x - accel_offsets[0];
-  float ay = a.acceleration.y - accel_offsets[1];
-  float az = a.acceleration.z - accel_offsets[2];
-  float pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
-  return pitch;
-}
-
-// Select TCA9548A multiplexer channel (0..7)
-void selectMuxChannel(uint8_t ch) {
-  if (ch > 7) return;
-  Wire.beginTransmission(TCAADDR);
-  Wire.write(1 << ch);
-  Wire.endTransmission();
-  // small delay to allow bus to settle
-  delay(1);
-}
-
-// single IMU instance will be used after selecting the appropriate mux channel
-
-void stopMotors() {
-  ledcWrite(pwmMotor1, 0);
-  ledcWrite(pwmMotor2, 0);
-  ledcWrite(pwmMotor3, 0);
-  Serial.println("All Motors Stopped");
-}
-
-// keep only nextionCommand (defined earlier)
-
-// Add simple timeout safety to motor movements
-bool waitUntilPitchCondition(uint32_t timeoutMs, std::function<bool(float)> condition, uint8_t mux_channel) {
-  uint32_t start = millis();
-  while (millis() - start < timeoutMs) {
-    selectMuxChannel(mux_channel);
-    sensors_event_t a, g, t;
-    imu.getEvent(&a, &g, &t);
-    float pitch = hAngle(a);
-    if (condition(pitch)) return true;
-    delay(20);
+void updateNextionHighlight() {
+  int maxSel = (currentPage == 0) ? 3 : 4;
+  for (int i = 0; i <= maxSel; i++) {
+    String btn = "b" + String(i);
+    if (i == currentSelection) {
+      nextionSend(btn + ".bco=65535"); // Highlight color (Yellow) - Change as needed
+    } else {
+      nextionSend(btn + ".bco=33281"); // Default color (Dark Blue) - Change as needed
+    }
+    nextionSend("ref " + btn);
   }
-  return false;
 }
 
-void TopUp(float target, int unused) {
-  digitalWrite(dirMotor1, HIGH);
-  ledcWrite(PWM_CHANNEL_MOTOR1, 255);
-  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p >= target; }, 0);
-  if (!ok) Serial.println("TopUp timeout");
-  stopMotors();
+void navigateNextion() {
+  int maxSel = (currentPage == 0) ? 3 : 4;
+  currentSelection++;
+  if (currentSelection > maxSel) currentSelection = 0;
+  updateNextionHighlight();
 }
 
-void TopDown(float target, int unused) {
-  digitalWrite(dirMotor1, LOW);
-  ledcWrite(PWM_CHANNEL_MOTOR1, 255);
-  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p <= target; }, 0);
-  if (!ok) Serial.println("TopDown timeout");
-  stopMotors();
-}
+void selectNextion() {
+  if (currentPage == 0) {
+    // Map selection to motor
+    if (currentSelection == 0) selectedMotor = 1;      // TOP -> M1
+    else if (currentSelection == 1) selectedMotor = 3; // RIGHT -> M3
+    else if (currentSelection == 2) selectedMotor = 2; // BOTTOM -> M2
+    else if (currentSelection == 3) selectedMotor = 3; // LEFT -> M3
 
-void BottomUp(float target, int unused) {
-  digitalWrite(dirMotor2, LOW);
-  ledcWrite(PWM_CHANNEL_MOTOR2, 255);
-  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p >= target; }, 2);
-  if (!ok) Serial.println("BottomUp timeout");
-  stopMotors();
-}
+    // Move to page 1
+    currentPage = 1;
+    currentSelection = 0;
+    nextionSend("page 1");
+    updateNextionHighlight();
+    
+  } else { // Page 1
+    if (currentSelection == 4) { 
+      // "menu" option -> go back to page 0
+      currentPage = 0;
+      currentSelection = 0;
+      nextionSend("page 0");
+      updateNextionHighlight();
+    } else {
+      // Movement options
+      int dir = 0;
+      if (currentSelection == 0 || currentSelection == 1) dir = 1;  // "0" or "30" -> UP
+      if (currentSelection == 2 || currentSelection == 3) dir = -1; // "45" or "60" -> DOWN
 
-void BottomDown(float target, int unused) {
-  digitalWrite(dirMotor2, HIGH);
-  ledcWrite(PWM_CHANNEL_MOTOR2, 255);
-  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p <= target; }, 2);
-  if (!ok) Serial.println("BottomDown timeout");
-  stopMotors();
-}
-
-void SideLeft(float target) {
-  digitalWrite(dirMotor3, LOW);
-  ledcWrite(PWM_CHANNEL_MOTOR3, 255);
-  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p >= target; }, 3);
-  if (!ok) Serial.println("SideLeft timeout");
-  stopMotors();
-}
-
-void SideRight(float target) {
-  digitalWrite(dirMotor3, HIGH);
-  ledcWrite(PWM_CHANNEL_MOTOR3, 255);
-  bool ok = waitUntilPitchCondition(10000, [&](float p){ return p <= target; }, 3);
-  if (!ok) Serial.println("SideRight timeout");
-  stopMotors();
-}
-
-void handling(String cmd) {
-  // cmd is expected to be "0" for cycle, "1" for select/confirm
-  if (cmd == "0") {
-    if (currentPage == 0) {
-      selPage0 = (selPage0 + 1) % 4;
-      Serial.print("Page0 selection -> "); Serial.println(selPage0);
-      // update colors: highlighted = 65504, others = 8200
-      for (int i = 0; i < 4; ++i) {
-        String c = String(PAGE0_BTN_NAMES[i]) + ".bco=" + String((i == selPage0) ? 65504 : 8200);
-        nextionCommand(c.c_str());
-      }
-    } else if (currentPage == 1) {
-      selPage1 = (selPage1 + 1) % 5;
-      Serial.print("Page1 selection -> "); Serial.println(selPage1);
-      for (int i = 0; i < 5; ++i) {
-        String c = String(PAGE1_BTN_NAMES[i]) + ".bco=" + String((i == selPage1) ? 65504 : 8200);
-        nextionCommand(c.c_str());
+      if (selectedMotor > 0 && dir != 0) {
+        int motorIdx = selectedMotor - 1;
+        udpTargetDir[motorIdx] = dir;
+        udpStopTime[motorIdx] = millis() + NEXTION_RUN_MS;
       }
     }
-    return;
   }
+}
 
-  if (cmd == "1") {
-    if (currentPage == 0) {
-      // confirm selection on page0 -> go to page1
-      int opt = selPage0;
-      Serial.print("Confirmed page0 opt: "); Serial.println(opt);
-      // move to page 1 on the Nextion
-      nextionCommand("page 1");
-      delay(50);
-      currentPage = 1;
-      selPage1 = 0;
-      // initialize page1 buttons colors
-      for (int i = 0; i < 5; ++i) {
-        String c = String(PAGE1_BTN_NAMES[i]) + ".bco=" + String((i == selPage1) ? 65504 : 8200);
-        nextionCommand(c.c_str());
+// ===================== BUTTON READING =====================
+void readButtons() {
+  for (int i = 0; i < 6; i++) {
+    btnStates[i] = digitalRead(btnPins[i]);
+  }
+}
+
+int getRequest(bool fwd, bool rev) {
+  if (fwd && rev) return 0; // Ignore if both pressed
+  if (fwd) return 1;
+  if (rev) return -1;
+  return 0;
+}
+
+// ===================== MOTOR STATE MACHINE =====================
+void updateMotor(Motor &m) {
+  uint32_t now = millis();
+  switch (m.state) {
+      case State::STOP:
+      m.currentDuty = 0;
+      ledcWrite(m.channel, 0);
+      if (m.targetDir != 0) {
+        int dirVal = (m.targetDir == 1) ? HIGH : LOW;
+        digitalWrite(m.dirPin, dirVal);
+        
+        // Print what the ESP32 is doing
+        Serial.printf("[MOTOR] Ch %d | DIR Pin %d set to %s\n", m.channel, m.dirPin, dirVal == HIGH ? "HIGH" : "LOW");
+        
+        m.state = (m.targetDir == 1) ? State::RUN_FWD : State::RUN_REV;
       }
-      return;
-    } else if (currentPage == 1) {
-      // confirm selection on page1
-      Serial.print("Confirmed page1 opt: "); Serial.println(selPage1);
-      if (selPage1 == 4) {
-        // back selected -> return to page0
-        nextionCommand("page 0");
-        delay(50);
-        currentPage = 0;
-        selPage0 = 0;
-        for (int i = 0; i < 4; ++i) {
-          String c = String(PAGE0_BTN_NAMES[i]) + ".bco=" + String((i == selPage0) ? 65504 : 8200);
-          nextionCommand(c.c_str());
+      break;
+
+    case State::RUN_FWD:
+    case State::RUN_REV:
+      if (m.currentDuty < MAX_DUTY) {
+        m.currentDuty += RAMP_STEP;
+        if (m.currentDuty > MAX_DUTY) m.currentDuty = MAX_DUTY;
+      }
+      ledcWrite(m.channel, m.currentDuty);
+
+      if ((m.targetDir == 0) || 
+          (m.targetDir == 1 && m.state == State::RUN_REV) || 
+          (m.targetDir == -1 && m.state == State::RUN_FWD)) {
+        ledcWrite(m.channel, 0);
+        m.currentDuty = 0;
+        m.state = State::COAST;
+        m.stateStart = now;
+      }
+      break;
+
+    case State::COAST:
+      if (now - m.stateStart >= COAST_MS) {
+        m.state = State::LOCKOUT;
+        m.stateStart = now;
+      }
+      break;
+
+    case State::LOCKOUT:
+      if (now - m.stateStart >= LOCKOUT_MS) {
+        if (m.targetDir == 0) {
+          m.state = State::STOP;
+        } else {
+          int dirVal = (m.targetDir == 1) ? HIGH : LOW;
+          digitalWrite(m.dirPin, dirVal);
+          
+          // Print what the ESP32 is doing
+          Serial.printf("[MOTOR] Ch %d | DIR Pin %d set to %s\n", m.channel, m.dirPin, dirVal == HIGH ? "HIGH" : "LOW");
+          
+          m.state = (m.targetDir == 1) ? State::RUN_FWD : State::RUN_REV;
         }
-        return;
       }
+      break;
+  }
+}
 
-      // else: a valid angle was selected (0,30,45,60)
-      float target = angleValues[selPage1];
-      int axis = selPage0; // axis selected previously on page0
-      sensors_event_t a,g,t;
-      // choose the correct IMU based on axis: 0=TOP,2=BOTTOM,1/3=SIDES
-      switch(axis) {
-        case 0:
-          selectMuxChannel(0);
-          imu.getEvent(&a,&g,&t);
-          break;
-        case 2:
-          selectMuxChannel(2);
-          imu.getEvent(&a,&g,&t);
-          break;
-        case 1:
-        case 3:
-        default:
-          selectMuxChannel(3);
-          imu.getEvent(&a,&g,&t);
-          break;
+// ===================== CONFLICT RESOLUTION =====================
+void forceStopAll() {
+  // Clear UDP timers and targets
+  for (int i = 0; i < 3; i++) {
+    udpTargetDir[i] = 0;
+    udpStopTime[i] = 0;
+  }
+  
+  // Clear Web targets
+  webTargetDir[0] = 0;
+  webTargetDir[1] = 0;
+  webTargetDir[2] = 0;
+
+  // Force state machine to STOP immediately
+  Motor* motors[3] = {&m1, &m2, &m3};
+  for (int i = 0; i < 3; i++) {
+    motors[i]->state = State::STOP;
+    motors[i]->currentDuty = 0;
+    ledcWrite(motors[i]->channel, 0);
+  }
+}
+
+// ===================== WEB COMMAND HANDLER =====================
+void handleCommand(const String& cmd) {
+  // Any web command immediately stops all active movements (Conflict Resolution)
+  forceStopAll();
+
+  if (cmd == "m1_fwd")        webTargetDir[0] = 1;
+  else if (cmd == "m1_rev")   webTargetDir[0] = -1;
+  else if (cmd == "m1_stop")  webTargetDir[0] = 0;
+  else if (cmd == "m2_fwd")  { webTargetDir[1] = 1;  Serial.println("[WEB] M2 -> FWD (1)"); }
+  else if (cmd == "m2_rev")  { webTargetDir[1] = -1; Serial.println("[WEB] M2 -> REV (-1)"); }
+  else if (cmd == "m2_stop") { webTargetDir[1] = 0;  Serial.println("[WEB] M2 -> STOP (0)"); }
+  else if (cmd == "m3_left")  webTargetDir[2] = 1;
+  else if (cmd == "m3_right") webTargetDir[2] = -1;
+  else if (cmd == "m3_stop")  webTargetDir[2] = 0;
+  else if (cmd == "stop") {
+    webTargetDir[0] = 0;
+    webTargetDir[1] = 0;
+    webTargetDir[2] = 0;
+  }
+}
+
+// ===================== HTML PAGE =====================
+const char htmlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Motor Control</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: #1a1a2e;
+      color: #eee;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 { color: #e94560; }
+    .status {
+      font-size: 1.2em;
+      margin: 15px 0;
+      padding: 10px;
+      background: #16213e;
+      border-radius: 8px;
+      color: #e94560;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      max-width: 400px;
+      margin: 20px auto;
+    }
+    button {
+      padding: 18px 10px;
+      font-size: 1.1em;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      color: #fff;
+      font-weight: bold;
+      transition: opacity 0.15s;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    button:active { opacity: 0.6; }
+    .btn-top    { background: #e94560; }
+    .btn-bottom { background: #0f3460; }
+    .btn-side   { background: #533483; }
+    .btn-stop   { background: #c70039; grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <h1>Motor Control</h1>
+  <div class="status">Status: <span id="st">IDLE</span></div>
+  <div class="grid">
+    <button class="btn-top"    ontouchstart="send('m1_fwd')"  onmousedown="send('m1_fwd')"  onmouseup="send('m1_stop')"  ontouchend="send('m1_stop')">TOP UP</button>
+    <button class="btn-top"    ontouchstart="send('m1_rev')"  onmousedown="send('m1_rev')"  onmouseup="send('m1_stop')"  ontouchend="send('m1_stop')">TOP DOWN</button>
+    <button class="btn-bottom" ontouchstart="send('m2_fwd')"  onmousedown="send('m2_fwd')"  onmouseup="send('m2_stop')"  ontouchend="send('m2_stop')">BOTTOM UP</button>
+    <button class="btn-bottom" ontouchstart="send('m2_rev')"  onmousedown="send('m2_rev')"  onmouseup="send('m2_stop')"  ontouchend="send('m2_stop')">BOTTOM DOWN</button>
+    <button class="btn-side"   ontouchstart="send('m3_left')" onmousedown="send('m3_left')" onmouseup="send('m3_stop')"  ontouchend="send('m3_stop')">SIDE LEFT</button>
+    <button class="btn-side"   ontouchstart="send('m3_right')" onmousedown="send('m3_right')" onmouseup="send('m3_stop')" ontouchend="send('m3_stop')">SIDE RIGHT</button>
+    <button class="btn-stop"   onclick="send('stop')">STOP ALL</button>
+  </div>
+  <script>
+    function send(cmd) {
+      fetch('/cmd?c=' + cmd)
+        .then(r => r.text())
+        .then(t => { document.getElementById('st').textContent = t; })
+        .catch(() => { document.getElementById('st').textContent = 'ERROR'; });
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send_P(200, "text/html", htmlPage);
+}
+
+void handleCmd() {
+  if (server.hasArg("c")) {
+    String cmd = server.arg("c");
+    handleCommand(cmd);
+
+    String status = "";
+    if (webTargetDir[0] == 1)  status += "M1_UP ";
+    else if (webTargetDir[0] == -1) status += "M1_DOWN ";
+    if (webTargetDir[1] == 1)  status += "M2_UP ";
+    else if (webTargetDir[1] == -1) status += "M2_DOWN ";
+    if (webTargetDir[2] == 1)  status += "M3_LEFT ";
+    else if (webTargetDir[2] == -1) status += "M3_RIGHT ";
+    if (status.length() == 0)  status = "IDLE";
+
+    server.send(200, "text/plain", status);
+  } else {
+    server.send(400, "text/plain", "Missing command");
+  }
+}
+
+// ===================== UDP PROCESSING =====================
+void processUDP() {
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    char incomingPacket[2] = {0};
+    int len = udp.read(incomingPacket, 1);
+    if (len > 0) {
+      if (incomingPacket[0] == '0') {
+        navigateNextion();
+      } else if (incomingPacket[0] == '1') {
+        selectNextion();
       }
-      float pitch = hAngle(a);
-      Serial.print("Moving axis "); Serial.print(axis); Serial.print(" to "); Serial.println(target);
-      switch(axis) {
-        case 0: // TOP
-          if (pitch < target) TopUp(target,0); else TopDown(target,0);
-          Serial.println("TOP movement implemented virtually");
-          break;
-        case 2: // BOTTOM
-          if (pitch < target) BottomUp(target,0); else BottomDown(target,0);
-          Serial.println("BOTTOM movement implemented virtually");
-          break;
-        case 1: // RIGHT
-          if (pitch < target) SideRight(target); else SideLeft(-target);
-          Serial.println("RIGHT movement implemented virtually");
-          break;
-        case 3: // LEFT
-          if (pitch < target) SideRight(target); else SideLeft(-target);
-          Serial.println("LEFT movement implemented virtually");
-          break;
-        default:
-          Serial.println("Invalid axis");
-      }
-      // Optionally notify Nextion that movement is done
-      String doneCmd = String("t1.txt=\"Done\"");
-      nextionCommand(doneCmd.c_str());
-      return;
     }
   }
 }
 
+// ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
-  // I2C pins for ESP32
-  const int SDA_PIN = 21;
-  const int SCL_PIN = 22;
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
-  Wire.begin(21, 22);
+  Serial1.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN); // Nextion Display
 
-  pinMode(pwmMotor1, OUTPUT);
-  pinMode(dirMotor1, OUTPUT);
-  pinMode(pwmMotor2, OUTPUT);
-  pinMode(dirMotor2, OUTPUT);
-  pinMode(pwmMotor3, OUTPUT);
-  pinMode(dirMotor3, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(DIR_M1, OUTPUT);
+  pinMode(DIR_M2, OUTPUT);
+  pinMode(DIR_M3, OUTPUT);
 
-  // Setup PWM channels for ESP32
-  ledcSetup(PWM_CHANNEL_MOTOR1, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(pwmMotor1, PWM_CHANNEL_MOTOR1);
-  ledcSetup(PWM_CHANNEL_MOTOR2, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(pwmMotor2, PWM_CHANNEL_MOTOR2);
-  ledcSetup(PWM_CHANNEL_MOTOR3, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(pwmMotor3, PWM_CHANNEL_MOTOR3);
+  ledcSetup(0, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PWM_M1, 0);
+  ledcSetup(1, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PWM_M2, 1);
+  ledcSetup(2, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PWM_M3, 2);
 
+  for (int i = 0; i < 6; i++) {
+    if (btnPins[i] == 34 || btnPins[i] == 35) {
+      pinMode(btnPins[i], INPUT); // Input-only pins — need external 10kΩ pull-down
+    } else {
+      pinMode(btnPins[i], INPUT_PULLDOWN); // Use internal pull-down
+    }
+  }
+
+  // Connect WiFi
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
+  WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -304,76 +405,50 @@ void setup() {
   Serial.println("\nConnected to WiFi");
   Serial.print("ESP32 IP address: ");
   Serial.println(WiFi.localIP());
-  udp.begin(localUdpPort);
-  Serial.print("Listening on UDP port "); Serial.println(localUdpPort);
-  
-  // Initialize IMUs behind TCA9548A multiplexer
-  selectMuxChannel(0);
-  if (!imu.begin(0x68)) {
-    Serial.println("MPU6050 (TOP) NOT found on mux channel 0!");
-    imuTop_ok = false;
-  } else {
-    Serial.println("MPU6050 (TOP) initialized on mux channel 0");
-    imu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    imuTop_ok = true;
-  }
 
-  selectMuxChannel(2);
-  if (!imu.begin(0x68)) {
-    Serial.println("MPU6050 (BOTTOM) NOT found on mux channel 2!");
-    imuBottom_ok = false;
-  } else {
-    Serial.println("MPU6050 (BOTTOM) initialized on mux channel 2");
-    imu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    imuBottom_ok = true;
-  }
+  // Start UDP
+  udp.begin(UDP_PORT);
+  Serial.println("UDP started on port 12345");
 
-  selectMuxChannel(3);
-  if (!imu.begin(0x68)) {
-    Serial.println("MPU6050 (SIDES) NOT found on mux channel 3!");
-    imuSides_ok = false;
-  } else {
-    Serial.println("MPU6050 (SIDES) initialized on mux channel 3");
-    imu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    imuSides_ok = true;
-  }
-  // Initialize Serial2 for Nextion display and go to page 0
-  Serial2.begin(NEXTION_BAUD, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
-  delay(100);
-  Serial.println("Initializing Nextion to page 0");
-  nextionCommand("page 0");
-  delay(50);
-  Serial.println("Initialized Nextion to page 0");
-  currentPage = 0;
-  selPage0 = 0;
-  // initialize page0 buttons: highlight first, others default
-  for (int i = 0; i < 4; ++i) {
-    String c = String(PAGE0_BTN_NAMES[i]) + ".bco=" + String((i == selPage0) ? 65504 : 8200);
-    nextionCommand(c.c_str());
-  }
-  // set a small idle text on t1
-  //nextionCommand("t1.txt=\"Idle\"");
+  // Start Web Server
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCmd);
+  server.begin();
+  Serial.println("Web server started on port 80");
+
+  // Initialize Nextion to Page 0
+  nextionSend("page 0");
+  updateNextionHighlight();
+
+  Serial.println("3-Motor Controller Ready (Upper, Lower, Side)");
 }
 
+// ===================== LOOP =====================
 void loop() {
-  int packetSize = udp.parsePacket();
-  if (packetSize) {
-    int len = udp.read(incomingPacket, sizeof(incomingPacket) - 1);
-    if (len > 0) {
-      incomingPacket[len] = 0;
-      Serial.print("Received from UDP: ");
-      Serial.println(incomingPacket);
-      if (strcmp(incomingPacket, "1") == 0) {
-        digitalWrite(LED_PIN, HIGH);
-        delay(200);
-        digitalWrite(LED_PIN, LOW);
-      } else if (strcmp(incomingPacket, "0") == 0) {
-        digitalWrite(LED_PIN, HIGH);
-        delay(800);
-        digitalWrite(LED_PIN, LOW);
-      }
-      handling(String(incomingPacket));
+  server.handleClient();
+  processUDP();
+
+  readButtons();
+
+  // Check UDP 5-second timers
+  uint32_t now = millis();
+  for (int i = 0; i < 3; i++) {
+    if (udpStopTime[i] > 0 && now >= udpStopTime[i]) {
+      udpTargetDir[i] = 0;
+      udpStopTime[i] = 0;
     }
   }
-  delay(50);
+
+  // Combine physical buttons, web commands, and UDP commands
+  int btn1 = getRequest(btnStates[0], btnStates[1]);
+  int btn2 = getRequest(btnStates[2], btnStates[3]);
+  int btn3 = getRequest(btnStates[4], btnStates[5]);
+
+  m1.targetDir = constrain(btn1 + webTargetDir[0] + udpTargetDir[0], -1, 1);
+  m2.targetDir = constrain(btn2 + webTargetDir[1] + udpTargetDir[1], -1, 1);
+  m3.targetDir = constrain(btn3 + webTargetDir[2] + udpTargetDir[2], -1, 1);
+
+  updateMotor(m1);
+  updateMotor(m2);
+  updateMotor(m3);
 }
