@@ -35,6 +35,7 @@ void clearAllButtonsOnPage();
 void handleNext();
 void handleSelect();
 void interpretBedCommand(String cmd);
+void applyTouchModeForCurrentPage();
 
 // Only 1 motor exists (torso/head section). "head" drives it; foot/leftTilt/
 // rightTilt are UI-only until more motors are added.
@@ -48,6 +49,11 @@ int headAngle = 0;
 int footAngle = 0;
 int leftTilt = 0;
 int rightTilt = 0;
+
+// Control mode: false = Nextion touch is active (default, physical presses
+// work); true = blink mode is active (USB blink bytes drive navigation,
+// physical Nextion touch is locked out via tsw so fingers do nothing).
+bool blinkModeEnabled = true;
 
 // Nextion-vs-web arbiter: any Nextion activity (USB blink byte or a real
 // H-command from the screen) locks the web API out for this many ms.
@@ -201,16 +207,11 @@ const char html_page[] PROGMEM = R"=====(
           <div class="panel-card">
             <div class="header-toggle-wrap">
               <h2>👁️ Eye-Blink Control</h2>
-              <div class="switch-box"><span>Off</span><label class="switch"><input type="checkbox" id="blinkToggle" /><span class="slider"></span></label><span class="active-state">On</span></div>
+              <div class="switch-box"><span>Off</span><label class="switch"><input type="checkbox" id="blinkToggle" checked /><span class="slider"></span></label><span class="active-state">On</span></div>
             </div>
             <div id="blinkPanel" class="blink-terminal">
-              <div class="chip-matrix" id="blinkOptionsContainer" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-bottom: 0.75rem;"></div>
-              <div class="terminal-footer" style="display: block;">
-                <button class="btn" id="selectBlinkBtn" style="background: var(--accent); color: var(--bg); font-weight: 700; border: none; width: 100%;">Trigger Action (Long Blink)</button>
-                <div class="selection-focus" style="margin-top: 0.5rem">Focus: <span id="currentBlinkOption">Head Up</span></div>
-              </div>
-              <div style="display: flex; flex-direction: column; gap: 0.4rem; border-top: 1px solid var(--border); padding-top: 0.75rem; font-size: 0.7rem; color: var(--text-muted);">
-                <div><strong>1 Short Blink:</strong> Next Item</div><div><strong>1 Long Blink:</strong> Select Item</div>
+              <div style="display: flex; flex-direction: column; gap: 0.4rem; padding-top: 0.25rem; font-size: 0.7rem; color: var(--text-muted);">
+                <div><strong>Short Blink:</strong> Hover</div><div><strong>Long Blink:</strong> Select</div>
               </div>
             </div>
           </div>
@@ -221,10 +222,9 @@ const char html_page[] PROGMEM = R"=====(
       (() => {
         let headAngle = 0, footAngle = 0, leftTilt = 0, rightTilt = 0;
         const MAX_HEAD = 60, MAX_FOOT = 30, MAX_TILT = 25;
-        let blinkActive = false, blinkTimer = null, blinkIndex = 0;
-        const blinkOptions = ["Head Up", "Head Down", "Foot Up", "Foot Down", "Left Tilt Up", "Left Tilt Down", "Right Tilt Up", "Right Tilt Down"];
+        let blinkActive = false;
         
-        const headSeg = document.getElementById("headSeg"), footSegContainer = document.getElementById("footSegContainer"), footFlapSeg = document.getElementById("footFlapSeg"), leftHalf = document.getElementById("leftHalf"), rightHalf = document.getElementById("rightHalf"), sagDisplay = document.getElementById("sagDisplay"), latDisplay = document.getElementById("latDisplay"), headPresetBtns = document.querySelectorAll("#headPresetGroup .btn.preset"), footPresetBtns = document.querySelectorAll("#footPresetGroup .btn.preset"), blinkToggle = document.getElementById("blinkToggle"), blinkPanel = document.getElementById("blinkPanel"), blinkOptionsContainer = document.getElementById("blinkOptionsContainer"), currentBlinkOptionSpan = document.getElementById("currentBlinkOption"), selectBlinkBtn = document.getElementById("selectBlinkBtn");
+        const headSeg = document.getElementById("headSeg"), footSegContainer = document.getElementById("footSegContainer"), footFlapSeg = document.getElementById("footFlapSeg"), leftHalf = document.getElementById("leftHalf"), rightHalf = document.getElementById("rightHalf"), sagDisplay = document.getElementById("sagDisplay"), latDisplay = document.getElementById("latDisplay"), headPresetBtns = document.querySelectorAll("#headPresetGroup .btn.preset"), footPresetBtns = document.querySelectorAll("#footPresetGroup .btn.preset"), blinkToggle = document.getElementById("blinkToggle"), blinkPanel = document.getElementById("blinkPanel");
 
         const statusBanner = document.getElementById("statusBanner");
         let bannerTimer = null;
@@ -254,10 +254,6 @@ const char html_page[] PROGMEM = R"=====(
           latDisplay.textContent = `Left ${leftTilt}° · Right ${rightTilt}°`;
           headPresetBtns.forEach(btn => btn.classList.toggle("active", headAngle === parseInt(btn.dataset.angle, 10)));
           footPresetBtns.forEach(btn => btn.classList.toggle("active", footAngle === parseInt(btn.dataset.angle, 10)));
-          if (blinkActive) {
-            document.querySelectorAll(".blink-chip").forEach((chip, idx) => chip.classList.toggle("current", idx === blinkIndex));
-            currentBlinkOptionSpan.textContent = blinkOptions[blinkIndex];
-          }
         }
         function setHeadPreset(angle) { removeDragClasses(); headAngle = angle; sendCmd(`/api?head=${headAngle}`); refreshUI(); }
         function setFootPreset(angle) { removeDragClasses(); footAngle = angle; sendCmd(`/api?foot=${footAngle}`); refreshUI(); }
@@ -275,25 +271,7 @@ const char html_page[] PROGMEM = R"=====(
         }
         function removeDragClasses() { [headSeg, footSegContainer, footFlapSeg, leftHalf, rightHalf].forEach(el => el.classList.remove("dragging-active")); }
         function addDragClasses() { [headSeg, footSegContainer, footFlapSeg, leftHalf, rightHalf].forEach(el => el.classList.add("dragging-active")); }
-        function executeBlinkOption(option) {
-          switch (option) {
-            case "Head Up": moveSagittal("head", "up"); break; case "Head Down": moveSagittal("head", "down"); break;
-            case "Foot Up": moveSagittal("foot", "up"); break; case "Foot Down": moveSagittal("foot", "down"); break;
-            case "Left Tilt Up": moveLateral("left", "up"); break; case "Left Tilt Down": moveLateral("left", "down"); break;
-            case "Right Tilt Up": moveLateral("right", "up"); break; case "Right Tilt Down": moveLateral("right", "down"); break;
-          }
-        }
-        function buildBlinkChips() {
-          blinkOptionsContainer.innerHTML = "";
-          blinkOptions.forEach((opt, idx) => {
-            const chip = document.createElement("div"); chip.className = "blink-chip"; chip.textContent = opt;
-            chip.addEventListener("click", () => { blinkIndex = idx; refreshUI(); executeBlinkOption(opt); });
-            blinkOptionsContainer.appendChild(chip);
-          });
-        }
-        function startBlinkSim() { if (blinkTimer) clearInterval(blinkTimer); blinkTimer = setInterval(() => { blinkIndex = (blinkIndex + 1) % blinkOptions.length; refreshUI(); }, 1800); }
-        function stopBlinkSim() { if (blinkTimer) { clearInterval(blinkTimer); blinkTimer = null; } }
-        function toggleBlink(enable) { blinkActive = enable; if (enable) { blinkPanel.classList.add("active"); buildBlinkChips(); refreshUI(); startBlinkSim(); } else { blinkPanel.classList.remove("active"); stopBlinkSim(); } }
+        function toggleBlink(enable) { blinkActive = enable; sendCmd(`/api?blinkMode=${enable ? 1 : 0}`); blinkPanel.classList.toggle("active", enable); }
 
         document.getElementById("headUpBtn").addEventListener("click", () => moveSagittal("head", "up"));
         document.getElementById("headDownBtn").addEventListener("click", () => moveSagittal("head", "down"));
@@ -306,7 +284,6 @@ const char html_page[] PROGMEM = R"=====(
         headPresetBtns.forEach(btn => btn.addEventListener("click", () => setHeadPreset(parseInt(btn.dataset.angle, 10))));
         footPresetBtns.forEach(btn => btn.addEventListener("click", () => setFootPreset(parseInt(btn.dataset.angle, 10))));
         blinkToggle.addEventListener("change", (e) => toggleBlink(e.target.checked));
-        selectBlinkBtn.addEventListener("click", () => { if (blinkActive) executeBlinkOption(blinkOptions[blinkIndex]); });
 
         let isDragging = false, activePart = null, startY = 0, startAngle = 0;
         function getClientY(e) { return e.touches ? e.touches[0].clientY : e.clientY; }
@@ -336,7 +313,8 @@ const char html_page[] PROGMEM = R"=====(
           refreshUI();
         }
         function handleDragEnd() { if (isDragging) { isDragging = false; activePart = null; setTimeout(removeDragClasses, 50); } }
-        removeDragClasses(); headAngle = 0; footAngle = 0; refreshUI(); window.addEventListener("beforeunload", stopBlinkSim);
+        removeDragClasses(); headAngle = 0; footAngle = 0; refreshUI();
+        toggleBlink(true); // page loads with blink mode on, matching the checked switch
       })();
     </script>
   </body>
@@ -350,6 +328,16 @@ void handleRoot() {
 
 // PRIORITY 2: dropped while the Nextion side is active
 void handleAPI() {
+  // Mode toggle from the web dashboard's blink switch - always allowed,
+  // even while Nextion has priority, since this changes which input
+  // method is active rather than commanding a movement.
+  if (server.hasArg("blinkMode")) {
+    blinkModeEnabled = server.arg("blinkMode").toInt() == 1;
+    applyTouchModeForCurrentPage();
+    server.send(200, "text/plain", blinkModeEnabled ? "BLINK_MODE_ON" : "BLINK_MODE_OFF");
+    return;
+  }
+
   if (nextionHasPriority()) {
     unsigned long remaining = NEXTION_PRIORITY_COOLDOWN_MS - (millis() - lastNextionActivityMillis);
     Serial.print("[BLOCKED] Web command ignored - Nextion has priority for another ");
@@ -584,6 +572,26 @@ void clearAllButtonsOnPage() {
   }
 }
 
+// Locks or unlocks physical finger presses on the Nextion for whichever
+// page is currently showing. tsw only disables real touch input - it does
+// NOT block the "click" command, so handleNext()/handleSelect() (blink
+// navigation) keep working even while a person's actual touches are locked.
+void applyTouchModeForCurrentPage() {
+  bool touchEnabled = !blinkModeEnabled;
+  String* btns;
+  int size;
+  if (currentPage == 0)      { btns = page0_btns; size = page0_size; }
+  else if (currentPage == 1) { btns = page1_btns; size = page1_size; }
+  else                       { btns = page2_btns; size = page2_size; }
+
+  for (int i = 0; i < size; i++) {
+    Serial2.print("tsw " + btns[i] + "," + String(touchEnabled ? 1 : 0));
+    endNextionCmd();
+  }
+  Serial.print("[MODE] Nextion physical touch ");
+  Serial.println(touchEnabled ? "ENABLED" : "LOCKED (blink mode active)");
+}
+
 void handleNext() {
   highlightCurrentButton(defaultColor);
   currentIndex++;
@@ -622,6 +630,7 @@ void handleSelect() {
     currentIndex = 0;
     clearAllButtonsOnPage();
     highlightCurrentButton(hoverColor);
+    applyTouchModeForCurrentPage();
   } else {
     highlightCurrentButton(hoverColor);
   }
@@ -721,6 +730,7 @@ void setup() {
   delay(500);
   clearAllButtonsOnPage();
   highlightCurrentButton(hoverColor);
+  applyTouchModeForCurrentPage();
 
   // --- Wi-Fi / Web server bring-up ---
   WiFi.softAP(ssid, password);
@@ -745,17 +755,21 @@ void loop() {
     readEncoder();
   }
 
-  // Blink commands from Python over USB (priority 1)
+  // Blink commands from Python over USB (priority 1, only when blink mode is on)
   if (Serial.available() > 0) {
     char incomingChar = Serial.read();
     Serial.print("[USB RX] Got byte: "); Serial.println(incomingChar);
-    markNextionActive();
-    if (incomingChar == '0') {
-      handleNext();
-      Serial.println("ACK:0");
-    } else if (incomingChar == '1') {
-      handleSelect();
-      Serial.println("ACK:1");
+    if (!blinkModeEnabled) {
+      Serial.println("[IGNORED] Blink mode is off - Nextion touch mode is active");
+    } else {
+      markNextionActive();
+      if (incomingChar == '0') {
+        handleNext();
+        Serial.println("ACK:0");
+      } else if (incomingChar == '1') {
+        handleSelect();
+        Serial.println("ACK:1");
+      }
     }
   }
 
