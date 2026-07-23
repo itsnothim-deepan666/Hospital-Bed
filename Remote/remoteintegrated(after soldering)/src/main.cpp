@@ -3,10 +3,14 @@
 // Pins: Wire 4/5 (MPU6050), encoder ADC 36, torso motor 12/13, 
 //       leg motor 25/26, remote shift register 27/14/19
 //
-// FIX (this version): Added a 50-sample IMU filter warm-up loop in setup()
-// to prevent "Start-Up Illusion" where the complementary filter hasn't 
-// mathematically settled before mapping the initial encoder rotations, 
-// which previously caused the homing sequence to overshoot past zero.
+// FIX (this version): torso homing was landing off true zero because of
+// mechanical backlash in the torso leadscrew/gearbox. Two changes fix it:
+//   1. Backlash compensation - whenever the torso motor needs to reverse
+//      direction, extra "slack take-up" rotations are added to the target
+//      so the real bed position (not just the encoder count) reaches zero.
+//   2. Creep speed near target - the motor slows down inside
+//      HOMING_SLOWDOWN_ZONE rotations of the target instead of running at
+//      full PWM until the exact count, which used to cause overshoot.
 
 #include <Wire.h>
 #include <Arduino.h>
@@ -23,11 +27,12 @@
 //   4 HeadDown   5 LegDown    6 LeftUp   7 Kill
 const int REMOTE_LATCH_PIN = 27;
 const int REMOTE_CLOCK_PIN = 14;
-const int REMOTE_DATA_PIN  = 19; // GPIO 19 with INPUT_PULLDOWN
+const int REMOTE_DATA_PIN  = 19; // Changed from 34! (GPIO 34 lacks internal pull-downs)
 
 // Second (leg/foot) motor driver - open-loop only, no encoder feedback.
 #define LEG_MOTOR_PWM_PIN 25
 #define LEG_MOTOR_DIR_PIN 26
+const int LEG_MOTOR_SPEED = 255;
 
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2 
@@ -139,10 +144,25 @@ bool motorMoving = false;
 // ---------------------------------------------------------------------
 // BACKLASH / CREEP TUNING
 // ---------------------------------------------------------------------
+// BACKLASH_COMPENSATION: how many extra encoder "rotations" of motor-shaft
+// travel are needed to take up the mechanical slack whenever the torso
+// motor reverses direction. Start with a small value (e.g. 4-8) and
+// increase on the bench: command a small up/down/up jog and see how many
+// rotations pass before the bed visibly starts moving again after a
+// reversal - that count is your BACKLASH_COMPENSATION.
 const long BACKLASH_COMPENSATION = 6;
+
+// Inside this many rotations of the target, the torso motor drops to
+// MOTOR_SPEED_SLOW so it doesn't blow past the exact count between
+// encoder polls (which was the main cause of homing overshoot).
 const long HOMING_SLOWDOWN_ZONE = 15;
 const int  MOTOR_SPEED_SLOW     = 90;
 
+// Tracks the last direction the torso motor actually drove in:
+// +1 = increasing, -1 = decreasing, 0 = unknown / not yet moved.
+// This persists across stops (including manual jog stops) so that the
+// NEXT move - whether manual or homing - knows whether it needs to pay
+// the backlash toll.
 int8_t torsoLastDirection = 0;
 
 void motorStop() { analogWrite(MOTOR_PWM_PIN, 0); }
@@ -155,6 +175,10 @@ void setupMotor() {
   motorStop();
 }
 
+// Adds a backlash "toll" to a raw target if reaching it requires the torso
+// motor to reverse direction from whatever it last actually drove.
+// This is what makes homing (and any programmatic move) land on the true
+// physical position instead of stopping short/long by the slack amount.
 long applyBacklashCompensation(long rawTarget) {
   int8_t neededDir = (rawTarget > rotations) ? 1 : (rawTarget < rotations ? -1 : 0);
 
@@ -168,11 +192,11 @@ long applyBacklashCompensation(long rawTarget) {
 }
 
 // ===================================================================
-// LEG/FOOT MOTOR (UPDATED TO DIGITAL BYPASS TO PREVENT DAC/PWM CONFLICT)
+// LEG/FOOT MOTOR
 // ===================================================================
-void legMotorStop()      { digitalWrite(LEG_MOTOR_PWM_PIN, LOW); }
-void legMotorDriveUp()   { digitalWrite(LEG_MOTOR_DIR_PIN, LOW); digitalWrite(LEG_MOTOR_PWM_PIN, HIGH); }
-void legMotorDriveDown() { digitalWrite(LEG_MOTOR_DIR_PIN, HIGH);  digitalWrite(LEG_MOTOR_PWM_PIN, HIGH); }
+void legMotorStop() { analogWrite(LEG_MOTOR_PWM_PIN, 0); }
+void legMotorDriveUp()   { digitalWrite(LEG_MOTOR_DIR_PIN, LOW); analogWrite(LEG_MOTOR_PWM_PIN, LEG_MOTOR_SPEED); }
+void legMotorDriveDown() { digitalWrite(LEG_MOTOR_DIR_PIN, HIGH);  analogWrite(LEG_MOTOR_PWM_PIN, LEG_MOTOR_SPEED); }
 
 void setupLegMotor() {
   pinMode(LEG_MOTOR_PWM_PIN, OUTPUT);
@@ -202,18 +226,18 @@ void commandHeadManual(int dir) {
     headManualJogActive = true;
     motorMoving = false; 
     motorDriveIncreasing();
-    torsoLastDirection = 1; 
+    torsoLastDirection = 1; // remember for next backlash calc
   } else if (dir == -1) {
     Serial.println("CMD: HEAD/TORSO LOWERING (real motor, manual jog)...");
     headManualJogActive = true;
     motorMoving = false;
     motorDriveDecreasing();
-    torsoLastDirection = -1; 
+    torsoLastDirection = -1; // remember for next backlash calc
   } else {
     Serial.println("CMD: HEAD/TORSO STOPPED.");
     motorStop();
     headManualJogActive = false;
-    targetRotations = rotations; 
+    targetRotations = rotations; // Snap target to current spot to prevent drifting back
   }
 }
 
@@ -221,8 +245,8 @@ void commandTiltSim(int dir) {
   if (dir == lastTiltState) return;
   lastTiltState = dir;
 
-  if (dir == 1) Serial.println("CMD: SIDE TILT -> RAISING LEFT [SIMULATED]");
-  else if (dir == 2) Serial.println("CMD: SIDE TILT -> RAISING RIGHT [SIMULATED]");
+  if (dir == 1) Serial.println("CMD: SIDE TILT -> RAISING LEFT [SIMULATED - no tilt motor installed]");
+  else if (dir == 2) Serial.println("CMD: SIDE TILT -> RAISING RIGHT (pushing Left to 0) [SIMULATED]");
   else Serial.println("CMD: SIDE TILT STOPPED. [SIMULATED]");
 }
 
@@ -235,8 +259,12 @@ void haltAllMotorsHard() {
   lastHeadState = 0;
   lastLegState = 0;
   commandTiltSim(0);
+  // NOTE: torsoLastDirection is intentionally NOT reset here - a hard
+  // stop/kill doesn't erase the mechanical slack state, so the next move
+  // still needs to know which way the motor last actually drove.
 }
 
+// Handles sequential homing routines across components
 void updateHomingSimulation() {
   if (!isHomingActive) return;
 
@@ -262,10 +290,15 @@ void updateHomingSimulation() {
     if (currentMillis - homingTimer > 2000) {
       Serial.println("HOMING Step 2 Complete [SIMULATED]. Activating physical closed-loop homing for Head/Torso (Target: 0 deg)...");
       
+      // Initialize closed-loop control sequence to physical 0 degrees.
+      // FIX: run the raw calibration target through backlash compensation
+      // so the motor pays the mechanical slack "toll" if it needs to
+      // reverse direction from whatever it last did (usually true, since
+      // homing is normally requested after manual jogging).
       long rawTarget = rollToRotations(0.0);
       targetRotations = applyBacklashCompensation(rawTarget);
       motorMoving = true;
-      headManualJogActive = false; 
+      headManualJogActive = false; // Override manual jog controls
       
       homingStage = 3;
       homingTimer = currentMillis;
@@ -273,6 +306,7 @@ void updateHomingSimulation() {
   } 
   // STAGE 3: Physical Head/Torso Zeroing via MPU6050 & Calibration Lookup
   else if (homingStage == 3) {
+    // Monitor the automated motor control sequence until tracking targets match position thresholds
     if (!motorMoving) {
       Serial.println("[ HOMING COMPLETE ] Head/Torso zeroed via closed-loop encoder tracking. System safe.");
       isHomingActive = false;
@@ -301,7 +335,10 @@ byte read74HC165() {
     int bitValue = digitalRead(REMOTE_DATA_PIN);
     value |= (bitValue << (7 - i));
     digitalWrite(REMOTE_CLOCK_PIN, HIGH);
-    delayMicroseconds(5); // Stabilizes signals over long cables
+    
+    // DELAY INCREASED TO 5us for 1-Meter cable stability
+    delayMicroseconds(5); 
+    
     digitalWrite(REMOTE_CLOCK_PIN, LOW);
   }
   return value;
@@ -318,19 +355,21 @@ void pollRemote() {
   digitalWrite(REMOTE_LATCH_PIN, HIGH);
   byte state = read74HC165();
 
-  bool btnHoming    = bitRead(state, 0); 
-  bool btnRightUp   = bitRead(state, 1); 
-  bool btnLegUp     = bitRead(state, 2); 
-  bool btnHeadUp    = bitRead(state, 3); 
+  // --- UPDATED BIT MAPPING BASED ON NEW WIRING ---
+  bool btnHoming    = bitRead(state, 0); // Pin 11 (D0)
+  bool btnRightUp   = bitRead(state, 1); // Pin 12 (D1)
+  bool btnLegUp     = bitRead(state, 2); // Pin 13 (D2)
+  bool btnHeadUp    = bitRead(state, 3); // Pin 14 (D3)
   
-  bool btnHeadDown  = bitRead(state, 4); 
-  bool btnLegDown   = bitRead(state, 5); 
-  bool btnLeftUp    = bitRead(state, 6); 
-  bool btnKill      = bitRead(state, 7); 
+  bool btnHeadDown  = bitRead(state, 4); // Pin 3  (D4)
+  bool btnLegDown   = bitRead(state, 5); // Pin 4  (D5)
+  bool btnLeftUp    = bitRead(state, 6); // Pin 5  (D6)
+  bool btnKill      = bitRead(state, 7); // Pin 6  (D7)
 
   bool isMoving = (btnHeadUp || btnHeadDown || btnLegUp || btnLegDown ||
                     btnLeftUp || btnRightUp || isHomingActive);
 
+  // --- PRIORITY 1: GLOBAL KILL SWITCH ---
   if (btnKill) {
     if (!lastKillState) {
       Serial.println("\n[ !!! EMERGENCY KILL SWITCH ACTIVATED !!! ]");
@@ -340,7 +379,7 @@ void pollRemote() {
     isHomingActive = false;
     homingStage = 0;
     haltAllMotorsHard();
-    digitalWrite(LED_BUILTIN, LOW); 
+    digitalWrite(LED_BUILTIN, LOW); // Solid ON = Emergency hold state
     return;
   } else if (lastKillState) {
     Serial.println("[ KILL SWITCH RELEASED - System Ready ]");
@@ -351,19 +390,21 @@ void pollRemote() {
 
   updateRemoteLED(isMoving);
 
+  // --- PRIORITY 2: AUTOMATED SEQUENCE RUNNER ---
   if (btnHoming && !isHomingActive) {
     Serial.println("\n[ HOMING SEQUENCE INITIATED ] Executing multi-axis systemic reset...");
     isHomingActive = true;
     homingStage = 1;
     homingTimer = millis();
-    haltAllMotorsHard(); 
+    haltAllMotorsHard(); // Clear existing target configurations
   }
   
   if (isHomingActive) {
     updateHomingSimulation();
-    return; 
+    return; // Hard lock manual inputs to preserve alignment profile parameters
   }
 
+  // --- PRIORITY 3: MANUAL AXIS INTERACTION LOOP ---
   if (btnHeadUp) commandHeadManual(1);
   else if (btnHeadDown) commandHeadManual(-1);
   else commandHeadManual(0);
@@ -423,6 +464,9 @@ void updateMotorControl() {
     return;
   }
 
+  // FIX: creep at reduced speed near the target instead of running full
+  // PWM all the way in, which used to overshoot past the exact count
+  // between 4ms encoder polls.
   int speed = (labs(error) <= HOMING_SLOWDOWN_ZONE) ? MOTOR_SPEED_SLOW : MOTOR_SPEED;
 
   if (error > 0) {
@@ -483,8 +527,6 @@ void setup() {
   rotations = rollToRotations(0.0);
 #else
   Wire.begin(4, 5);
-  Wire.setClock(100000); // Lowers I2C frequency to Standard Mode (100kHz), making it less sensitive to high-frequency noise.
-  Wire.setTimeOut(100);  // Forces the ESP32 to abort a corrupted transaction after 100ms instead of hanging indefinitely.
   setupMPU();
   delay(200);
   calibrateMPU();
@@ -497,24 +539,6 @@ void setup() {
   cFilterPitch.angle = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
   lastMicros = micros();
 
-  // === NEW IMU FILTER WARM-UP LOOP ===
-  Serial.println("Stabilizing IMU filter...");
-  for (int i = 0; i < 50; i++) {
-    readMPU();
-    unsigned long now = micros();
-    float dt = (now - lastMicros) / 1000000.0;
-    lastMicros = now;
-    
-    float currentAx = AcX - accOffsetX; 
-    float currentAy = AcY - accOffsetY; 
-    float currentAz = AcZ - accOffsetZ;
-    float gxRate = (GyX - gyroOffsetX) / GYRO_SCALE;
-    float rollAcc  = atan2(currentAy, currentAz) * 180.0 / PI;
-    
-    cFilterRoll.update(gxRate, rollAcc, dt);
-    delay(10); 
-  }
-  // Filter is mathematically settled. Safe to look up initial position.
   rotations = rollToRotations(cFilterRoll.angle);
 #endif
 
@@ -525,7 +549,10 @@ void setup() {
   pinMode(REMOTE_LATCH_PIN, OUTPUT);
   pinMode(REMOTE_CLOCK_PIN, OUTPUT);
   digitalWrite(REMOTE_LATCH_PIN, HIGH);
+  
+  // CHANGED TO INPUT_PULLDOWN FOR SAFETY (Defaults to 0 if tether breaks)
   pinMode(REMOTE_DATA_PIN, INPUT_PULLDOWN); 
+  
   digitalWrite(REMOTE_CLOCK_PIN, LOW);
   
   pinMode(LED_BUILTIN, OUTPUT);
